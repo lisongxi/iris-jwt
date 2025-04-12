@@ -453,6 +453,11 @@ func (mw *IrisJWTMiddleware) RefreshToken(ctx iris.Context) (string, time.Time, 
 		return "", time.Now(), err
 	}
 
+	origIat, ok := claims["orig_iat"]
+	if !ok {
+		return "", time.Now(), errors.New("orig_iat not present in token")
+	}
+
 	newToken := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
 	newClaims := newToken.Claims.(jwt.MapClaims)
 
@@ -462,14 +467,14 @@ func (mw *IrisJWTMiddleware) RefreshToken(ctx iris.Context) (string, time.Time, 
 
 	expire := mw.TimeFunc().Add(mw.TimeoutFunc(claims))
 	newClaims["exp"] = expire.Unix()
-	newClaims["orig_iat"] = mw.TimeFunc().Unix()
+	newClaims["orig_iat"] = origIat
+
 	tokenString, err := mw.signedString(newToken)
 	if err != nil {
 		return "", time.Now(), err
 	}
 
 	mw.SetCookie(ctx, tokenString)
-
 	return tokenString, expire, nil
 }
 
@@ -477,15 +482,30 @@ func (mw *IrisJWTMiddleware) RefreshToken(ctx iris.Context) (string, time.Time, 
 func (mw *IrisJWTMiddleware) CheckIfTokenExpire(ctx iris.Context) (jwt.MapClaims, error) {
 	token, err := mw.ParseToken(ctx)
 	if err != nil {
-		validationErr, ok := err.(*jwt.ValidationError)
-		if !ok || validationErr.Errors != jwt.ValidationErrorExpired {
+		var validationErr *jwt.ValidationError
+		if errors.As(err, &validationErr) && validationErr.Errors == jwt.ValidationErrorExpired {
+		} else {
 			return nil, err
 		}
 	}
 
 	claims := token.Claims.(jwt.MapClaims)
 
-	origIat := int64(claims["orig_iat"].(float64))
+	origIatValue := claims["orig_iat"]
+	var origIat int64
+
+	switch v := origIatValue.(type) {
+	case float64:
+		origIat = int64(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return nil, err
+		}
+		origIat = n
+	default:
+		return nil, errors.New("invalid orig_iat format")
+	}
 
 	if origIat < mw.TimeFunc().Add(-mw.MaxRefresh).Unix() {
 		return nil, ErrExpiredToken
